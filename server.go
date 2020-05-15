@@ -123,33 +123,6 @@ func LoadCredentials(filename string) KeyTab {
 	}
 }
 
-// LoadCredentialsFromEtcKrb5Keytab loads keytab from default location
-/*
-func LoadCredentialsFromEtcKrb5Keytab() KeyTab {
-	log.Println("Reading /etc/krb5.keytab")
-
-	serviceName := "HTTP/localhost"
-	serviceNameC := C.CString(serviceName)
-	serviceNameGssBuffer :=
-
-	var majStat C.OM_uint32
-	var minStat C.OM_uint32
-	var credHandle C.gss_cred_id_t
-	majStat = C.gss_acquire_cred(&minStat,
-		my_gss_name,
-		C.GSS_C_INDEFINITE,
-		C.GSS_C_NO_OID_SET,
-		C.GSS_C_ACCEPT,
-		&credHandle,
-		(*C.gss_OID_set)(C.NULL),
-		(*C.OM_uint32)(C.NULL))
-
-	return KeyTab{
-		inner: credHandle,
-	}
-}
-*/
-
 // RequestAuthenticated is a guard to an HTTP request and returns boolean value indicating
 // that the user is successfully authenticated
 func RequestAuthenticated(w http.ResponseWriter, r *http.Request, keytab KeyTab) bool {
