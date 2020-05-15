@@ -2,19 +2,25 @@ package main
 
 /*
 #cgo LDFLAGS: -lgssapi_krb5
+#include <string.h>
 #include <stdlib.h>
 #include <gssapi/gssapi.h>
 #include <gssapi/gssapi_ext.h>
 
+// Helper functions for type conversions and struct access on Go-C boundary
+
 gss_buffer_t GssBufferTypeFromVoidPtr(void *buffer, size_t length) {
 	// https://tools.ietf.org/html/rfc2744.html#section-3.2
 	gss_buffer_t ptr = (gss_buffer_t)malloc(sizeof(gss_buffer_desc));
+	void *new_buffer = malloc(length);
+	memcpy(buffer, new_buffer, length);
 	ptr->length = length;
-	ptr->value = buffer;
+	ptr->value = new_buffer;
 	return ptr;
 }
 
 void FreeGssBufferType(gss_buffer_t buffer) {
+	free(buffer->value);
 	free(buffer);
 }
 
@@ -33,6 +39,7 @@ OM_uint32 GssError(OM_uint32 maj_stat) {
 import "C"
 
 import (
+	"bytes"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -78,63 +85,6 @@ type KeyTab struct {
 	inner C.gss_cred_id_t
 }
 
-// dumpRequest is used for debugging to display the whole HTTP request as a plain text
-func dumpRequest(r *http.Request) {
-	requestDump, err := httputil.DumpRequest(r, true)
-	if err != nil {
-		fmt.Println(err)
-	}
-	fmt.Println(string(requestDump))
-}
-
-// byteArrayToGssBuffer performs type conversion from []byte to C.gss_buffer_t
-// TODO: investigate who is responsible for calling free() on the buffer, not the
-// dynamically allocated gss_buffer_desc
-func byteArrayToGssBuffer(buffer []byte) C.gss_buffer_t {
-	return C.GssBufferTypeFromVoidPtr(unsafe.Pointer(&buffer[0]), (C.size_t)(len(buffer)))
-}
-
-// LogGSSMajorStatus accepts a major status from a GSSAPI call and in case of errors it
-// logs the human readable messages describing the failure.
-func LogGSSMajorStatus(majStat C.OM_uint32, header string) {
-	var minStat C.OM_uint32
-	if C.GssError(majStat) != 0 {
-		// Log the description of the operation that went wrong
-		log.Println(header)
-
-		// There might have been multiple errors, in such case it is necessary to call
-		// gss_display_status multiple times and keeping the context (messageContext)
-		// More info: https://tools.ietf.org/html/rfc2744.html#section-5.11
-		var messageContext C.OM_uint32 = 0
-		var statusString C.gss_buffer_desc
-		for {
-			log.Println("Running gss display status")
-			majStat2 := C.gss_display_status(
-				&minStat,
-				majStat,
-				C.GSS_C_GSS_CODE,
-				C.GSS_C_NO_OID,
-				&messageContext,
-				&statusString,
-			)
-
-			// Debug print
-			log.Println("Major status 2:", majStat2)
-
-			// Convert gss buffer to a Go String a log the error
-			msg := C.GoStringN(C.GssBufferGetValue(&statusString), C.GssBufferGetLength(&statusString))
-			log.Println("GSS Error:", msg)
-			C.gss_release_buffer(&minStat, &statusString)
-
-			// Check if there are more errors to display
-			if messageContext == 0 {
-				break
-			}
-		}
-	}
-
-}
-
 // LoadCredentials takes a filename of a keytab and uses GSSAPI extension from krb5 library
 // to load it as a KeyTab structure which contains gss_cred_id_t structure
 func LoadCredentials(filename string) KeyTab {
@@ -147,14 +97,19 @@ func LoadCredentials(filename string) KeyTab {
 		log.Fatal(err)
 	}
 
-	log.Println("Converting keytab into buffer")
-	var inputToken C.gss_buffer_t = byteArrayToGssBuffer(content)
+	// Convert byte array to golang byte buffer
+	var b bytes.Buffer
+	b.Write(content)
+
+	log.Println("Converting keytab into gss buffer")
+	var inputToken C.gss_buffer_t = byteBufferToGssBuffer(b)
 	defer C.FreeGssBufferType(inputToken)
 
 	log.Println("Calling gss import cred")
 	var majStat C.OM_uint32
 	var minStat C.OM_uint32
 	var credHandle C.gss_cred_id_t
+	// FIXME: "An unsupported mechanism was requested"
 	majStat = C.gss_import_cred(&minStat, inputToken, &credHandle)
 
 	// Debug prints
@@ -167,6 +122,33 @@ func LoadCredentials(filename string) KeyTab {
 		inner: credHandle,
 	}
 }
+
+// LoadCredentialsFromEtcKrb5Keytab loads keytab from default location
+/*
+func LoadCredentialsFromEtcKrb5Keytab() KeyTab {
+	log.Println("Reading /etc/krb5.keytab")
+
+	serviceName := "HTTP/localhost"
+	serviceNameC := C.CString(serviceName)
+	serviceNameGssBuffer :=
+
+	var majStat C.OM_uint32
+	var minStat C.OM_uint32
+	var credHandle C.gss_cred_id_t
+	majStat = C.gss_acquire_cred(&minStat,
+		my_gss_name,
+		C.GSS_C_INDEFINITE,
+		C.GSS_C_NO_OID_SET,
+		C.GSS_C_ACCEPT,
+		&credHandle,
+		(*C.gss_OID_set)(C.NULL),
+		(*C.OM_uint32)(C.NULL))
+
+	return KeyTab{
+		inner: credHandle,
+	}
+}
+*/
 
 // RequestAuthenticated is a guard to an HTTP request and returns boolean value indicating
 // that the user is successfully authenticated
@@ -237,4 +219,69 @@ func RequestAuthenticated(w http.ResponseWriter, r *http.Request, keytab KeyTab)
 	}
 	log.Println("Authentication failed")
 	return false
+}
+
+// LogGSSMajorStatus accepts a major status from a GSSAPI call and in case of errors it
+// logs the human readable messages describing the failure.
+func LogGSSMajorStatus(majStat C.OM_uint32, header string) {
+	var minStat C.OM_uint32
+	if C.GssError(majStat) != 0 {
+		// Log the description of the operation that went wrong
+		log.Println(header)
+
+		// There might have been multiple errors, in such case it is necessary to call
+		// gss_display_status multiple times and keeping the context (messageContext)
+		// More info: https://tools.ietf.org/html/rfc2744.html#section-5.11
+		var messageContext C.OM_uint32 = 0
+		var statusString C.gss_buffer_desc
+		for {
+			log.Println("Running gss display status")
+			majStat2 := C.gss_display_status(
+				&minStat,
+				majStat,
+				C.GSS_C_GSS_CODE,
+				C.GSS_C_NO_OID,
+				&messageContext,
+				&statusString,
+			)
+
+			// Debug print
+			log.Println("Major status 2:", majStat2)
+
+			// Convert gss buffer to a Go String a log the error
+			msg := C.GoStringN(C.GssBufferGetValue(&statusString), C.GssBufferGetLength(&statusString))
+			log.Println("GSS Error:", msg)
+			C.gss_release_buffer(&minStat, &statusString)
+
+			// Check if there are more errors to display
+			if messageContext == 0 {
+				break
+			}
+		}
+	}
+
+}
+
+// dumpRequest is used for debugging to display the whole HTTP request as a plain text
+func dumpRequest(r *http.Request) {
+	requestDump, err := httputil.DumpRequest(r, true)
+	if err != nil {
+		fmt.Println(err)
+	}
+	fmt.Println(string(requestDump))
+}
+
+// byteArrayToGssBuffer performs type conversion from []byte to C.gss_buffer_t
+// TODO: investigate who is responsible for calling free() on the buffer, not the
+// dynamically allocated gss_buffer_desc
+func byteArrayToGssBuffer(buffer []byte) C.gss_buffer_t {
+	return C.GssBufferTypeFromVoidPtr(unsafe.Pointer(&buffer[0]), (C.size_t)(len(buffer)))
+}
+
+// byteBufferToGssBuffer performs type conversion from bytes.Buffer to C.gss_buffer_t
+// TODO: investigate who is responsible for calling free() on the buffer, not the
+// dynamically allocated gss_buffer_desc
+func byteBufferToGssBuffer(buffer bytes.Buffer) C.gss_buffer_t {
+	b := buffer.Bytes()
+	return C.GssBufferTypeFromVoidPtr(unsafe.Pointer(&b[0]), (C.size_t)(buffer.Len()))
 }
