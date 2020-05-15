@@ -74,6 +74,8 @@ func main() {
 /*
 # Unresolved questions:
  * Do I need to use dlopen or can the gssapi library be loaded while the process is starting?
+ * Does the HTTP header contain data that I can directly feed into gss_accept_sec_context?
+ * Is it a correct way to load the keytab file as a byte buffer and feed it to gss_import_cred?
 
 # Bugs:
  * See FIXME: in the code
