@@ -72,11 +72,15 @@ func main() {
 }
 
 /*
-# TODO:
- * Load the library dynamically? Isn't it possible to let the linker do this for me?
+# Unresolved questions:
+ * Do I need to use dlopen or can the gssapi library be loaded while the process is starting?
+
+# Bugs:
+ * See FIXME: in the code
+
+# Improvements:
  * Use something better than 10:
  * Fix either GssError or reportGSSStatus because one reports failure and the other one does not
- * Fix authentication as it does not work
 */
 
 // KeyTab represents loaded Kerberos keytab. Inside it uses GSSAPI generic storage
@@ -164,6 +168,7 @@ func RequestAuthenticated(w http.ResponseWriter, r *http.Request, keytab KeyTab)
 	var retFlags C.uint = 0
 	var credHdl C.gss_cred_id_t = keytab.inner
 
+	// FIXME: A required output parameter could not be written
 	majStat := C.gss_accept_sec_context(&minStat,
 		&contextHdl,                 // If I don't need to keep the context for further calls, this should be fine
 		credHdl,                     // I think I need to load keytab here somehow
