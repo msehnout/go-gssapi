@@ -61,6 +61,7 @@ import (
 	"log"
 	"net/http"
 	"net/http/httputil"
+	"regexp"
 	"unsafe"
 )
 
@@ -182,29 +183,42 @@ func RequestAuthenticated(w http.ResponseWriter, r *http.Request, keytab KeyTab)
 
 	// implement SPNEGO inside HTTP as described here:
 	// https://tools.ietf.org/html/rfc4559#section-5
-	auth := r.Header.Get("Authorization")
-	if auth == "" {
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" {
 		w.Header().Set("WWW-Authenticate", "Negotiate")
 		w.WriteHeader(http.StatusUnauthorized)
+		log.Println("Missing header")
 		return false
 	}
 
 	// Decode the base64 input from user
 	// 10: because that's the length of 'Negotiate '
 	// TODO: use something better then 10:
-	inputTokenBase64 := []byte(auth[10:])
-	var inputTokenBytes []byte = make([]byte, 4096)
-	log.Println("Decoding header")
-	n, err := base64.StdEncoding.Decode(inputTokenBytes, inputTokenBase64)
-	log.Println("Decoded", n, "bytes from the Negotiate header")
-	if err != nil {
-		log.Printf("Error decoding input token: %s ", err.Error())
+
+	// Make sure the header uses the right format
+	re := regexp.MustCompile(`Negotiate ([0-9A-Za-z+/]+==)`)
+	ret := re.FindSubmatch([]byte(authHeader))
+	if ret == nil {
 		w.WriteHeader(http.StatusBadRequest)
+		log.Println("Bad header")
+		return false
+	}
+	// FindSubmatch returns 2 slices, one contains the whole match and the second one only
+	// the part in parentheses
+	inputTokenBase64 := ret[1]
+	var inputTokenBytes []byte = make([]byte, len(inputTokenBase64))
+	log.Println("Header length:", len(inputTokenBase64))
+	log.Println("Decoding header:", string(inputTokenBase64))
+	inputTokenLength, err := base64.StdEncoding.Decode(inputTokenBytes, inputTokenBase64)
+	log.Println("Decoded", inputTokenLength, "bytes from the Negotiate header")
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		log.Printf("Error decoding input token: %s ", err.Error())
 		return false
 	}
 
 	log.Println("Converting input token")
-	var inputToken C.gss_buffer_t = byteArrayToGssBuffer(inputTokenBytes, n)
+	var inputToken C.gss_buffer_t = byteArrayToGssBuffer(inputTokenBytes, inputTokenLength)
 	log.Println("Input token length:", inputToken.length)
 	defer C.FreeGssBufferType(inputToken)
 
@@ -242,7 +256,7 @@ func RequestAuthenticated(w http.ResponseWriter, r *http.Request, keytab KeyTab)
 
 	// Check if the user is authenticated
 	// TODO: this does not seem to work properly
-	if majStat&C.GSS_S_COMPLETE != 0 {
+	if majStat&C.GSS_S_COMPLETE == 0 {
 		log.Println("Successfully authenticated")
 		return true
 	}
