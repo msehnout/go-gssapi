@@ -204,6 +204,9 @@ func RequestAuthenticated(w http.ResponseWriter, r *http.Request, keytab Keytab)
 	var client C.gss_cred_id_t = C.GSS_C_NO_CREDENTIAL
 
 	// FIXME: Invalid token was supplied
+	// Client side uses:
+	// $ echo password | kinit user@LOCAL
+	// $ curl -v --negotiate -u user:password localhost:9000
 	majStat := C.gss_accept_sec_context(
 		&minStat,
 		&contextHdl,                 // If I don't need to keep the context for further calls, this should be fine
