@@ -32,6 +32,7 @@ int GssBufferGetLength(gss_buffer_desc *buf) {
 	return buf->length;
 }
 
+// Wrapper around macro
 OM_uint32 GssError(OM_uint32 maj_stat) {
 	return GSS_ERROR(maj_stat);
 }
@@ -40,6 +41,12 @@ gss_key_value_set_desc GssKeyValSetDesc() {
 	static gss_key_value_element_desc store_elements[] = { { .key = "keytab", .value = "/tmp/keytab" } };
 	static gss_key_value_set_desc cockpit_ktab_store = { .count = 1, .elements = store_elements };
 	return cockpit_ktab_store;
+}
+
+// Wrapper around macro
+gss_buffer_desc GssGetEmptyBuffer() {
+	gss_buffer_desc ret = GSS_C_EMPTY_BUFFER;
+	return ret;
 }
 
 */
@@ -188,7 +195,8 @@ func RequestAuthenticated(w http.ResponseWriter, r *http.Request, keytab KeyTab)
 	inputTokenBase64 := []byte(auth[10:])
 	var inputTokenBytes []byte = make([]byte, 4096)
 	log.Println("Decoding header")
-	_, err := base64.StdEncoding.Decode(inputTokenBytes, inputTokenBase64)
+	n, err := base64.StdEncoding.Decode(inputTokenBytes, inputTokenBase64)
+	log.Println("Decoded", n, "bytes from the Negotiate header")
 	if err != nil {
 		log.Printf("Error decoding input token: %s ", err.Error())
 		w.WriteHeader(http.StatusBadRequest)
@@ -196,7 +204,8 @@ func RequestAuthenticated(w http.ResponseWriter, r *http.Request, keytab KeyTab)
 	}
 
 	log.Println("Converting input token")
-	var inputToken C.gss_buffer_t = byteArrayToGssBuffer(inputTokenBytes)
+	var inputToken C.gss_buffer_t = byteArrayToGssBuffer(inputTokenBytes, n)
+	log.Println("Input token length:", inputToken.length)
 	defer C.FreeGssBufferType(inputToken)
 
 	// Call "accept security context" as described here:
@@ -207,18 +216,20 @@ func RequestAuthenticated(w http.ResponseWriter, r *http.Request, keytab KeyTab)
 	//var outputToken C.gss_buffer_t
 	var retFlags C.uint = 0
 	var credHdl C.gss_cred_id_t = keytab.inner
+	var output C.gss_buffer_desc = C.GssGetEmptyBuffer()
 
 	// FIXME: A required output parameter could not be written
 	majStat := C.gss_accept_sec_context(&minStat,
 		&contextHdl,                 // If I don't need to keep the context for further calls, this should be fine
-		credHdl,                     // I think I need to load keytab here somehow
+		credHdl,                     // the loaded keytab
 		inputToken,                  // This is what I've got from the client
 		C.GSS_C_NO_CHANNEL_BINDINGS, // input_chan_bindings
 		(*C.gss_name_t)(C.NULL),     // src_name
 		(*C.gss_OID)(C.NULL),        // mech_type
 		// token to be passed back to the caller, but since I don't implement support for keeping the context,
 		// I cannot handle it. Needs to be released with call to gss_release_buffer()
-		C.GSS_C_NO_BUFFER,          // TODO: set to GSS_C_NO_BUFFER
+		//C.GSS_C_NO_BUFFER,
+		&output,
 		(*C.uint)(&retFlags),       // ret_flags, allows for further configuration
 		(*C.uint)(C.NULL),          // time_rec
 		(*C.gss_cred_id_t)(C.NULL)) // delegated_cred_handle
@@ -292,8 +303,8 @@ func dumpRequest(r *http.Request) {
 // byteArrayToGssBuffer performs type conversion from []byte to C.gss_buffer_t
 // TODO: investigate who is responsible for calling free() on the buffer, not the
 // dynamically allocated gss_buffer_desc
-func byteArrayToGssBuffer(buffer []byte) C.gss_buffer_t {
-	return C.GssBufferTypeFromVoidPtr(unsafe.Pointer(&buffer[0]), (C.size_t)(len(buffer)))
+func byteArrayToGssBuffer(buffer []byte, length int) C.gss_buffer_t {
+	return C.GssBufferTypeFromVoidPtr(unsafe.Pointer(&buffer[0]), (C.size_t)(length))
 }
 
 // byteBufferToGssBuffer performs type conversion from bytes.Buffer to C.gss_buffer_t
