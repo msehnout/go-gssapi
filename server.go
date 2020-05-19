@@ -35,6 +35,13 @@ int GssBufferGetLength(gss_buffer_desc *buf) {
 OM_uint32 GssError(OM_uint32 maj_stat) {
 	return GSS_ERROR(maj_stat);
 }
+
+gss_key_value_set_desc GssKeyValSetDesc() {
+	static gss_key_value_element_desc store_elements[] = { { .key = "keytab", .value = "/tmp/keytab" } };
+	static gss_key_value_set_desc cockpit_ktab_store = { .count = 1, .elements = store_elements };
+	return cockpit_ktab_store;
+}
+
 */
 import "C"
 
@@ -55,7 +62,7 @@ func main() {
 
 	// Load keytab into memory
 	log.Println("Loading credentials")
-	var keytab KeyTab = LoadCredentials("/tmp/keytab")
+	var keytab KeyTab = LoadCredentials2()
 
 	// Create a handler function which takes the keytab in a closure.
 	// TODO: I assume it is static and safe to share between the go green
@@ -73,9 +80,9 @@ func main() {
 
 /*
 # Unresolved questions:
- * Do I need to use dlopen or can the gssapi library be loaded while the process is starting?
  * Does the HTTP header contain data that I can directly feed into gss_accept_sec_context?
  * Is it a correct way to load the keytab file as a byte buffer and feed it to gss_import_cred?
+ * How to get the username from token in HTTP header
 
 # Bugs:
  * See FIXME: in the code
@@ -129,6 +136,37 @@ func LoadCredentials(filename string) KeyTab {
 	}
 }
 
+// LoadCredentials2 takes a filename of a keytab and uses GSSAPI extension from krb5 library
+// to load it as a KeyTab structure which contains gss_cred_id_t structure
+func LoadCredentials2() KeyTab {
+	var majStat C.OM_uint32
+	var minStat C.OM_uint32
+	var credHandle C.gss_cred_id_t = C.GSS_C_NO_CREDENTIAL
+	var cockpitKtabStore C.gss_key_value_set_desc = C.GssKeyValSetDesc()
+
+	majStat = C.gss_acquire_cred_from(
+		&minStat,                 // minor_status
+		C.GSS_C_NO_NAME,          // desired_name
+		C.GSS_C_INDEFINITE,       // time_req
+		C.GSS_C_NO_OID_SET,       // desired_mechs
+		C.GSS_C_ACCEPT,           // cred_usage
+		&cockpitKtabStore,        // cred_store
+		&credHandle,              // output_cred_handle
+		(*C.gss_OID_set)(C.NULL), // actual_mechs
+		(*C.OM_uint32)(C.NULL),   // time_rec
+	)
+
+	// Debug prints
+	log.Println("Major status:", majStat)
+	log.Println("Minor status:", minStat)
+
+	LogGSSMajorStatus(majStat, "There was an error in loading credentials")
+
+	return KeyTab{
+		inner: credHandle,
+	}
+}
+
 // RequestAuthenticated is a guard to an HTTP request and returns boolean value indicating
 // that the user is successfully authenticated
 func RequestAuthenticated(w http.ResponseWriter, r *http.Request, keytab KeyTab) bool {
@@ -166,7 +204,7 @@ func RequestAuthenticated(w http.ResponseWriter, r *http.Request, keytab KeyTab)
 	log.Println("Calling gss accept sec context")
 	var minStat C.OM_uint32
 	var contextHdl C.gss_ctx_id_t = C.GSS_C_NO_CONTEXT
-	var outputToken C.gss_buffer_t
+	//var outputToken C.gss_buffer_t
 	var retFlags C.uint = 0
 	var credHdl C.gss_cred_id_t = keytab.inner
 
@@ -180,7 +218,7 @@ func RequestAuthenticated(w http.ResponseWriter, r *http.Request, keytab KeyTab)
 		(*C.gss_OID)(C.NULL),        // mech_type
 		// token to be passed back to the caller, but since I don't implement support for keeping the context,
 		// I cannot handle it. Needs to be released with call to gss_release_buffer()
-		outputToken,
+		C.GSS_C_NO_BUFFER,          // TODO: set to GSS_C_NO_BUFFER
 		(*C.uint)(&retFlags),       // ret_flags, allows for further configuration
 		(*C.uint)(C.NULL),          // time_rec
 		(*C.gss_cred_id_t)(C.NULL)) // delegated_cred_handle
