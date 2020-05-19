@@ -1,4 +1,18 @@
+/*
+This package contains Go wrapper around GSSAPI C-bindings found in krb5-devel RPM package.
+It exports 3 public members:
+ * Keytab structure
+ * LoadKeytab function
+ * RequestAuthenticated function
+
+In order to write a Kerberos aware HTTP service, load the Keytab using the LoadKeytab function
+and use RequestAuthenticated in each endpoint handler that requires authentication. The function
+itself returns correct HTTP status code and headers in case the authentication fails therefore
+you need to provide only what happens in case the authentication was successfull.
+*/
 package main
+
+// This is a magic comment which is in fact a C source code used by cgo
 
 /*
 #cgo LDFLAGS: -lgssapi_krb5
@@ -57,7 +71,6 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"net/http/httputil"
@@ -65,12 +78,13 @@ import (
 	"unsafe"
 )
 
+// === Example usage ===
 func main() {
 	portNumber := "9000"
 
 	// Load keytab into memory
 	log.Println("Loading credentials")
-	var keytab KeyTab = LoadCredentials2()
+	var keytab Keytab = LoadKeytab()
 
 	// Create a handler function which takes the keytab in a closure.
 	// TODO: I assume it is static and safe to share between the go green
@@ -78,75 +92,32 @@ func main() {
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if RequestAuthenticated(w, r, keytab) {
 			io.WriteString(w, "hello\n")
-		} else {
-			io.WriteString(w, "bye\n")
 		}
 	})
 	log.Println("Server listening on port ", portNumber)
 	http.ListenAndServe(":"+portNumber, nil)
 }
 
+// === GSSAPI wrapper ===
+
 /*
 # Unresolved questions:
- * Does the HTTP header contain data that I can directly feed into gss_accept_sec_context?
- * Is it a correct way to load the keytab file as a byte buffer and feed it to gss_import_cred?
  * How to get the username from token in HTTP header
 
-# Bugs:
- * See FIXME: in the code
-
-# Improvements:
- * Use something better than 10:
+# Missing pieces:
  * Fix either GssError or reportGSSStatus because one reports failure and the other one does not
+ * Input token is not valid: do I need to process the input token somehow??
 */
 
-// KeyTab represents loaded Kerberos keytab. Inside it uses GSSAPI generic storage
+// Keytab represents loaded Kerberos keytab. Inside it uses GSSAPI generic storage
 // for credentials but we don't intend to support any other authentication than krb.
-type KeyTab struct {
+type Keytab struct {
 	inner C.gss_cred_id_t
 }
 
-// LoadCredentials takes a filename of a keytab and uses GSSAPI extension from krb5 library
-// to load it as a KeyTab structure which contains gss_cred_id_t structure
-func LoadCredentials(filename string) KeyTab {
-	// More info here:
-	// https://web.mit.edu/kerberos/krb5-devel/doc/appdev/gssapi.html#importing-and-exporting-credentials
-	log.Println("Reading keytab")
-	// Content is a byte array ([]byte) which contains binary data loaded from the file
-	content, err := ioutil.ReadFile(filename)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// Convert byte array to golang byte buffer
-	var b bytes.Buffer
-	b.Write(content)
-
-	log.Println("Converting keytab into gss buffer")
-	var inputToken C.gss_buffer_t = byteBufferToGssBuffer(b)
-	defer C.FreeGssBufferType(inputToken)
-
-	log.Println("Calling gss import cred")
-	var majStat C.OM_uint32
-	var minStat C.OM_uint32
-	var credHandle C.gss_cred_id_t
-	// FIXME: "An unsupported mechanism was requested"
-	majStat = C.gss_import_cred(&minStat, inputToken, &credHandle)
-
-	// Debug prints
-	log.Println("Major status:", majStat)
-	log.Println("Minor status:", minStat)
-
-	LogGSSMajorStatus(majStat, "There was an error in loading credentials")
-
-	return KeyTab{
-		inner: credHandle,
-	}
-}
-
-// LoadCredentials2 takes a filename of a keytab and uses GSSAPI extension from krb5 library
-// to load it as a KeyTab structure which contains gss_cred_id_t structure
-func LoadCredentials2() KeyTab {
+// LoadKeytab takes a filename of a keytab and uses GSSAPI extension from krb5 library
+// to load it as a Keytab structure which contains gss_cred_id_t structure
+func LoadKeytab() Keytab {
 	var majStat C.OM_uint32
 	var minStat C.OM_uint32
 	var credHandle C.gss_cred_id_t = C.GSS_C_NO_CREDENTIAL
@@ -168,16 +139,16 @@ func LoadCredentials2() KeyTab {
 	log.Println("Major status:", majStat)
 	log.Println("Minor status:", minStat)
 
-	LogGSSMajorStatus(majStat, "There was an error in loading credentials")
+	logGSSMajorStatus(majStat, "There was an error in loading credentials")
 
-	return KeyTab{
+	return Keytab{
 		inner: credHandle,
 	}
 }
 
 // RequestAuthenticated is a guard to an HTTP request and returns boolean value indicating
 // that the user is successfully authenticated
-func RequestAuthenticated(w http.ResponseWriter, r *http.Request, keytab KeyTab) bool {
+func RequestAuthenticated(w http.ResponseWriter, r *http.Request, keytab Keytab) bool {
 	// dump the request for debugging purposes
 	dumpRequest(r)
 
@@ -190,10 +161,6 @@ func RequestAuthenticated(w http.ResponseWriter, r *http.Request, keytab KeyTab)
 		log.Println("Missing header")
 		return false
 	}
-
-	// Decode the base64 input from user
-	// 10: because that's the length of 'Negotiate '
-	// TODO: use something better then 10:
 
 	// Make sure the header uses the right format
 	re := regexp.MustCompile(`Negotiate ([0-9A-Za-z+/]+==)`)
@@ -230,29 +197,34 @@ func RequestAuthenticated(w http.ResponseWriter, r *http.Request, keytab KeyTab)
 	//var outputToken C.gss_buffer_t
 	var retFlags C.uint = 0
 	var credHdl C.gss_cred_id_t = keytab.inner
+	var name C.gss_name_t = C.GSS_C_NO_NAME
+	var mechType C.gss_OID = C.GSS_C_NO_OID
 	var output C.gss_buffer_desc = C.GssGetEmptyBuffer()
+	var caps C.OM_uint32 = 0
+	var client C.gss_cred_id_t = C.GSS_C_NO_CREDENTIAL
 
-	// FIXME: A required output parameter could not be written
-	majStat := C.gss_accept_sec_context(&minStat,
+	// FIXME: Invalid token was supplied
+	majStat := C.gss_accept_sec_context(
+		&minStat,
 		&contextHdl,                 // If I don't need to keep the context for further calls, this should be fine
 		credHdl,                     // the loaded keytab
 		inputToken,                  // This is what I've got from the client
 		C.GSS_C_NO_CHANNEL_BINDINGS, // input_chan_bindings
-		(*C.gss_name_t)(C.NULL),     // src_name
-		(*C.gss_OID)(C.NULL),        // mech_type
+		&name,                       // src_name
+		&mechType,                   // mech_type
 		// token to be passed back to the caller, but since I don't implement support for keeping the context,
 		// I cannot handle it. Needs to be released with call to gss_release_buffer()
 		//C.GSS_C_NO_BUFFER,
 		&output,
-		(*C.uint)(&retFlags),       // ret_flags, allows for further configuration
-		(*C.uint)(C.NULL),          // time_rec
-		(*C.gss_cred_id_t)(C.NULL)) // delegated_cred_handle
+		&retFlags, // ret_flags, allows for further configuration
+		&caps,     // time_rec
+		&client)   // delegated_cred_handle
 
 	// Debug prints
 	log.Println("Major status:", majStat)
 	log.Println("Minor status:", minStat)
 
-	LogGSSMajorStatus(majStat, "There was an error in accepting the security context")
+	logGSSMajorStatus(majStat, "There was an error in accepting the security context")
 
 	// Check if the user is authenticated
 	// TODO: this does not seem to work properly
@@ -264,9 +236,9 @@ func RequestAuthenticated(w http.ResponseWriter, r *http.Request, keytab KeyTab)
 	return false
 }
 
-// LogGSSMajorStatus accepts a major status from a GSSAPI call and in case of errors it
+// logGSSMajorStatus accepts a major status from a GSSAPI call and in case of errors it
 // logs the human readable messages describing the failure.
-func LogGSSMajorStatus(majStat C.OM_uint32, header string) {
+func logGSSMajorStatus(majStat C.OM_uint32, header string) {
 	var minStat C.OM_uint32
 	if C.GssError(majStat) != 0 {
 		// Log the description of the operation that went wrong
