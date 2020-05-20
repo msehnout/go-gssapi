@@ -139,7 +139,8 @@ func LoadKeytab() Keytab {
 	log.Println("Minor status:", minStat)
 
 	if C.GssError(majStat) != 0 {
-		logGSSMajorStatus(majStat, "There was an error in loading credentials")
+		log.Println("There was an error in loading credentials")
+		logGSSStatus(majStat, minStat)
 		panic("Failed to load credentials")
 	}
 
@@ -235,27 +236,35 @@ func RequestAuthenticated(w http.ResponseWriter, r *http.Request, keytab Keytab)
 	log.Println("Major status:", majStat)
 	log.Println("Minor status:", minStat)
 
+	// Check for errors in the accept sec context routine
 	if C.GssError(majStat) != 0 {
-		logGSSMajorStatus(majStat, "There was an error in accepting the security context")
+		log.Println("There was an error in accepting the security context")
+		logGSSStatus(majStat, minStat)
+		w.WriteHeader(http.StatusBadRequest)
+		return false
+	}
+
+	// If the routine returned continuation needed, return 401 because we don't support it
+	if majStat&C.GSS_S_CONTINUE_NEEDED != 0 {
+		log.Println("Continuation needed, but we don't support it")
 		w.WriteHeader(http.StatusBadRequest)
 		return false
 	}
 
 	// Check if the user is authenticated
-	if majStat&C.GSS_S_COMPLETE == 0 {
+	if majStat&C.GSS_S_COMPLETE != 0 {
 		log.Println("Successfully authenticated")
 		return true
 	}
+
 	log.Println("Authentication failed")
 	return false
 }
 
 // logGSSMajorStatus accepts a major status from a GSSAPI call and in case of errors it
 // logs the human readable messages describing the failure.
-func logGSSMajorStatus(majStat C.OM_uint32, header string) {
-	var minStat C.OM_uint32
-	// Log the description of the operation that went wrong
-	log.Println(header)
+func logGSSStatus(majStat, minStat C.OM_uint32) {
+	var minStat2 C.OM_uint32
 
 	// There might have been multiple errors, in such case it is necessary to call
 	// gss_display_status multiple times and keeping the context (messageContext)
@@ -265,13 +274,17 @@ func logGSSMajorStatus(majStat C.OM_uint32, header string) {
 	for {
 		log.Println("Running gss display status")
 		majStat2 := C.gss_display_status(
-			&minStat,
+			&minStat2,
 			majStat,
 			C.GSS_C_GSS_CODE,
 			C.GSS_C_NO_OID,
 			&messageContext,
 			&statusString,
 		)
+
+		if C.GssError(majStat2) != 0 {
+			break
+		}
 
 		// Debug print
 		log.Println("Major status 2:", majStat2)
@@ -287,6 +300,36 @@ func logGSSMajorStatus(majStat C.OM_uint32, header string) {
 		}
 	}
 
+	minStat2 = 0
+	messageContext = 0
+	for {
+		log.Println("Running gss display status")
+		majStat2 := C.gss_display_status(
+			&minStat2,
+			majStat,
+			C.GSS_C_MECH_CODE,
+			C.GSS_C_NULL_OID,
+			&messageContext,
+			&statusString,
+		)
+
+		if C.GssError(majStat2) != 0 {
+			break
+		}
+
+		// Debug print
+		log.Println("Major status 2:", majStat2)
+
+		// Convert gss buffer to a Go String a log the error
+		msg := C.GoStringN(C.GssBufferGetValue(&statusString), C.GssBufferGetLength(&statusString))
+		log.Println("GSS Error:", msg)
+		C.gss_release_buffer(&minStat, &statusString)
+
+		// Check if there are more errors to display
+		if messageContext == 0 {
+			break
+		}
+	}
 }
 
 // dumpRequest is used for debugging to display the whole HTTP request as a plain text
