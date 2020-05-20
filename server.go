@@ -102,10 +102,9 @@ func main() {
 
 /*
 # Unresolved questions:
- * How to get the username from token in HTTP header
+ * How to get the username from token in HTTP header, we need to know who is authenticated.
 
 # Missing pieces:
- * Fix either GssError or reportGSSStatus because one reports failure and the other one does not
  * Input token is not valid: do I need to process the input token somehow??
 */
 
@@ -139,7 +138,10 @@ func LoadKeytab() Keytab {
 	log.Println("Major status:", majStat)
 	log.Println("Minor status:", minStat)
 
-	logGSSMajorStatus(majStat, "There was an error in loading credentials")
+	if C.GssError(majStat) != 0 {
+		logGSSMajorStatus(majStat, "There was an error in loading credentials")
+		panic("Failed to load credentials")
+	}
 
 	return Keytab{
 		inner: credHandle,
@@ -162,7 +164,7 @@ func RequestAuthenticated(w http.ResponseWriter, r *http.Request, keytab Keytab)
 		return false
 	}
 
-	// Make sure the header uses the right format
+	// Make sure the header uses the right format and cut the base64 encoded token
 	re := regexp.MustCompile(`Negotiate ([0-9A-Za-z+/]+==)`)
 	ret := re.FindSubmatch([]byte(authHeader))
 	if ret == nil {
@@ -171,9 +173,11 @@ func RequestAuthenticated(w http.ResponseWriter, r *http.Request, keytab Keytab)
 		return false
 	}
 	// FindSubmatch returns 2 slices, one contains the whole match and the second one only
-	// the part in parentheses
+	// the part in parentheses so this is only the token
 	inputTokenBase64 := ret[1]
+	// The length of binary token cannot be bigger than the length of base64 encoded one
 	var inputTokenBytes []byte = make([]byte, len(inputTokenBase64))
+	// Debug prints
 	log.Println("Header length:", len(inputTokenBase64))
 	log.Println("Decoding header:", string(inputTokenBase64))
 	inputTokenLength, err := base64.StdEncoding.Decode(inputTokenBytes, inputTokenBase64)
@@ -184,6 +188,7 @@ func RequestAuthenticated(w http.ResponseWriter, r *http.Request, keytab Keytab)
 		return false
 	}
 
+	// Convert from Go []byte to C gss_buffer_t
 	log.Println("Converting input token")
 	var inputToken C.gss_buffer_t = byteArrayToGssBuffer(inputTokenBytes, inputTokenLength)
 	log.Println("Input token length:", inputToken.length)
@@ -194,7 +199,6 @@ func RequestAuthenticated(w http.ResponseWriter, r *http.Request, keytab Keytab)
 	log.Println("Calling gss accept sec context")
 	var minStat C.OM_uint32
 	var contextHdl C.gss_ctx_id_t = C.GSS_C_NO_CONTEXT
-	//var outputToken C.gss_buffer_t
 	var retFlags C.uint = 0
 	var credHdl C.gss_cred_id_t = keytab.inner
 	var name C.gss_name_t = C.GSS_C_NO_NAME
@@ -203,21 +207,25 @@ func RequestAuthenticated(w http.ResponseWriter, r *http.Request, keytab Keytab)
 	var caps C.OM_uint32 = 0
 	var client C.gss_cred_id_t = C.GSS_C_NO_CREDENTIAL
 
+	// With this implementation we can process only one HTTP request, so there is no point running the
+	// gss_accept_sec_context in a loop as recommended in the RFC, but Kerberos should not require further
+	// calls. Inspired by:
+	// https://github.com/cockpit-project/cockpit/commit/9a42521626f85d7caf52d532008ec476256d04c7#diff-45425284ad53ac259e388e0e643c3563R490
+
 	// FIXME: Invalid token was supplied
 	// Client side uses:
 	// $ echo password | kinit user@LOCAL
 	// $ curl -v --negotiate -u user:password localhost:9000
 	majStat := C.gss_accept_sec_context(
 		&minStat,
-		&contextHdl,                 // If I don't need to keep the context for further calls, this should be fine
-		credHdl,                     // the loaded keytab
+		&contextHdl,
+		credHdl,                     // The loaded keytab
 		inputToken,                  // This is what I've got from the client
 		C.GSS_C_NO_CHANNEL_BINDINGS, // input_chan_bindings
 		&name,                       // src_name
 		&mechType,                   // mech_type
 		// token to be passed back to the caller, but since I don't implement support for keeping the context,
 		// I cannot handle it. Needs to be released with call to gss_release_buffer()
-		//C.GSS_C_NO_BUFFER,
 		&output,
 		&retFlags, // ret_flags, allows for further configuration
 		&caps,     // time_rec
@@ -227,10 +235,13 @@ func RequestAuthenticated(w http.ResponseWriter, r *http.Request, keytab Keytab)
 	log.Println("Major status:", majStat)
 	log.Println("Minor status:", minStat)
 
-	logGSSMajorStatus(majStat, "There was an error in accepting the security context")
+	if C.GssError(majStat) != 0 {
+		logGSSMajorStatus(majStat, "There was an error in accepting the security context")
+		w.WriteHeader(http.StatusBadRequest)
+		return false
+	}
 
 	// Check if the user is authenticated
-	// TODO: this does not seem to work properly
 	if majStat&C.GSS_S_COMPLETE == 0 {
 		log.Println("Successfully authenticated")
 		return true
@@ -243,38 +254,36 @@ func RequestAuthenticated(w http.ResponseWriter, r *http.Request, keytab Keytab)
 // logs the human readable messages describing the failure.
 func logGSSMajorStatus(majStat C.OM_uint32, header string) {
 	var minStat C.OM_uint32
-	if C.GssError(majStat) != 0 {
-		// Log the description of the operation that went wrong
-		log.Println(header)
+	// Log the description of the operation that went wrong
+	log.Println(header)
 
-		// There might have been multiple errors, in such case it is necessary to call
-		// gss_display_status multiple times and keeping the context (messageContext)
-		// More info: https://tools.ietf.org/html/rfc2744.html#section-5.11
-		var messageContext C.OM_uint32 = 0
-		var statusString C.gss_buffer_desc
-		for {
-			log.Println("Running gss display status")
-			majStat2 := C.gss_display_status(
-				&minStat,
-				majStat,
-				C.GSS_C_GSS_CODE,
-				C.GSS_C_NO_OID,
-				&messageContext,
-				&statusString,
-			)
+	// There might have been multiple errors, in such case it is necessary to call
+	// gss_display_status multiple times and keeping the context (messageContext)
+	// More info: https://tools.ietf.org/html/rfc2744.html#section-5.11
+	var messageContext C.OM_uint32 = 0
+	var statusString C.gss_buffer_desc
+	for {
+		log.Println("Running gss display status")
+		majStat2 := C.gss_display_status(
+			&minStat,
+			majStat,
+			C.GSS_C_GSS_CODE,
+			C.GSS_C_NO_OID,
+			&messageContext,
+			&statusString,
+		)
 
-			// Debug print
-			log.Println("Major status 2:", majStat2)
+		// Debug print
+		log.Println("Major status 2:", majStat2)
 
-			// Convert gss buffer to a Go String a log the error
-			msg := C.GoStringN(C.GssBufferGetValue(&statusString), C.GssBufferGetLength(&statusString))
-			log.Println("GSS Error:", msg)
-			C.gss_release_buffer(&minStat, &statusString)
+		// Convert gss buffer to a Go String a log the error
+		msg := C.GoStringN(C.GssBufferGetValue(&statusString), C.GssBufferGetLength(&statusString))
+		log.Println("GSS Error:", msg)
+		C.gss_release_buffer(&minStat, &statusString)
 
-			// Check if there are more errors to display
-			if messageContext == 0 {
-				break
-			}
+		// Check if there are more errors to display
+		if messageContext == 0 {
+			break
 		}
 	}
 
