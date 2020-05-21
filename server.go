@@ -23,10 +23,25 @@ package main
 
 // Helper functions for type conversions and struct access on Go-C boundary
 
+const gss_buffer_desc SERVICE_NAME = {
+	.value = "HTTP/localhost",
+	.length = 15
+};
+
 gss_buffer_t GssBufferTypeFromVoidPtr(void *buffer, size_t length) {
 	// https://tools.ietf.org/html/rfc2744.html#section-3.2
 	gss_buffer_t ptr = (gss_buffer_t)malloc(sizeof(gss_buffer_desc));
-	void *new_buffer = malloc(length);
+	void *new_buffer = calloc(length, '\0');
+	memcpy(buffer, new_buffer, length);
+	ptr->length = length;
+	ptr->value = new_buffer;
+	return ptr;
+}
+
+gss_buffer_t GssBufferTypeFromCharPtr(char *buffer, size_t length) {
+	// https://tools.ietf.org/html/rfc2744.html#section-3.2
+	gss_buffer_t ptr = (gss_buffer_t)malloc(sizeof(gss_buffer_desc));
+	void *new_buffer = calloc(length+1, '\0');
 	memcpy(buffer, new_buffer, length);
 	ptr->length = length;
 	ptr->value = new_buffer;
@@ -74,6 +89,7 @@ import (
 	"log"
 	"net/http"
 	"net/http/httputil"
+	"os"
 	"regexp"
 	"unsafe"
 )
@@ -82,15 +98,11 @@ import (
 func main() {
 	portNumber := "9000"
 
-	// Load keytab into memory
-	log.Println("Loading credentials")
-	var keytab Keytab = LoadKeytab()
-
 	// Create a handler function which takes the keytab in a closure.
 	// TODO: I assume it is static and safe to share between the go green
 	// threads, but this assumtion might be wrong
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if RequestAuthenticated(w, r, keytab) {
+		if RequestAuthenticated(w, r) {
 			io.WriteString(w, "hello\n")
 		}
 	})
@@ -119,12 +131,58 @@ type Keytab struct {
 func LoadKeytab() Keytab {
 	var majStat C.OM_uint32
 	var minStat C.OM_uint32
+
+	log.Println("gss_import_name")
+	//name := "HTTP/localhost"
+	//var inputNameBuffer C.gss_buffer_t = C.GssBufferTypeFromCharPtr(C.CString(name), (C.size_t)(len(name)))
+	var inputNameBuffer C.gss_buffer_t = &C.SERVICE_NAME
+	var serviceName C.gss_name_t
+	majStat = C.gss_import_name(
+		&minStat,
+		inputNameBuffer,
+		C.GSS_C_NO_OID,
+		&serviceName,
+	)
+	// Debug prints
+	log.Println("Major status:", majStat)
+	log.Println("Minor status:", minStat)
+
+	if C.GssError(majStat) != 0 {
+		log.Println("There was an error in import name function")
+		logGSSStatus(majStat, minStat)
+		panic("Failed to load credentials")
+	}
+
+	var outputName C.gss_buffer_t
+	var outputNameType C.gss_OID
+	majStat = C.gss_display_name(
+		&minStat,
+		serviceName,
+		outputName,
+		&outputNameType,
+	)
+
+	// Debug prints
+	log.Println("Major status:", majStat)
+	log.Println("Minor status:", minStat)
+
+	if C.GssError(majStat) != 0 {
+		log.Println("There was an error in display name function")
+		logGSSStatus(majStat, minStat)
+		panic("Failed to load credentials")
+	}
+
+	displayNameGo := C.GoString((*C.char)(outputName.value))
+	log.Println("display name:", displayNameGo)
+
 	var credHandle C.gss_cred_id_t = C.GSS_C_NO_CREDENTIAL
 	var cockpitKtabStore C.gss_key_value_set_desc = C.GssKeyValSetDesc()
 
+	log.Println("Empty credHandle:", credHandle == C.GSS_C_NO_CREDENTIAL)
+
 	majStat = C.gss_acquire_cred_from(
 		&minStat,                 // minor_status
-		C.GSS_C_NO_NAME,          // desired_name
+		serviceName,              // desired_name
 		C.GSS_C_INDEFINITE,       // time_req
 		C.GSS_C_NO_OID_SET,       // desired_mechs
 		C.GSS_C_ACCEPT,           // cred_usage
@@ -133,6 +191,8 @@ func LoadKeytab() Keytab {
 		(*C.gss_OID_set)(C.NULL), // actual_mechs
 		(*C.OM_uint32)(C.NULL),   // time_rec
 	)
+
+	log.Println("Empty credHandle:", credHandle == C.GSS_C_NO_CREDENTIAL)
 
 	// Debug prints
 	log.Println("Major status:", majStat)
@@ -151,9 +211,11 @@ func LoadKeytab() Keytab {
 
 // RequestAuthenticated is a guard to an HTTP request and returns boolean value indicating
 // that the user is successfully authenticated
-func RequestAuthenticated(w http.ResponseWriter, r *http.Request, keytab Keytab) bool {
+func RequestAuthenticated(w http.ResponseWriter, r *http.Request) bool {
 	// dump the request for debugging purposes
 	dumpRequest(r)
+
+	//log.Println("Empty credHandle:", keytab.inner == C.GSS_C_NO_CREDENTIAL)
 
 	// implement SPNEGO inside HTTP as described here:
 	// https://tools.ietf.org/html/rfc4559#section-5
@@ -197,11 +259,12 @@ func RequestAuthenticated(w http.ResponseWriter, r *http.Request, keytab Keytab)
 
 	// Call "accept security context" as described here:
 	// https://tools.ietf.org/html/rfc2744#section-5.1
+	os.Setenv("KRB5_KTNAME", "/tmp/keytab")
 	log.Println("Calling gss accept sec context")
 	var minStat C.OM_uint32
 	var contextHdl C.gss_ctx_id_t = C.GSS_C_NO_CONTEXT
 	var retFlags C.uint = 0
-	var credHdl C.gss_cred_id_t = keytab.inner
+	var credHdl C.gss_cred_id_t = C.GSS_C_NO_CREDENTIAL
 	var name C.gss_name_t = C.GSS_C_NO_NAME
 	var mechType C.gss_OID = C.GSS_C_NO_OID
 	var output C.gss_buffer_desc = C.GssGetEmptyBuffer()
@@ -306,7 +369,7 @@ func logGSSStatus(majStat, minStat C.OM_uint32) {
 		log.Println("Running gss display status")
 		majStat2 := C.gss_display_status(
 			&minStat2,
-			majStat,
+			minStat,
 			C.GSS_C_MECH_CODE,
 			C.GSS_C_NULL_OID,
 			&messageContext,
