@@ -1,14 +1,12 @@
 /*
 This package contains Go wrapper around GSSAPI C-bindings found in krb5-devel RPM package.
-It exports 3 public members:
- * Keytab structure
- * LoadKeytab function
+It exports only 1 public member:
  * RequestAuthenticated function
 
-In order to write a Kerberos aware HTTP service, load the Keytab using the LoadKeytab function
-and use RequestAuthenticated in each endpoint handler that requires authentication. The function
-itself returns correct HTTP status code and headers in case the authentication fails therefore
-you need to provide only what happens in case the authentication was successfull.
+In order to write a Kerberos aware HTTP service use RequestAuthenticated in each endpoint handler
+that requires authentication. The function itself returns correct HTTP status code and headers in
+case the authentication fails therefore you need to provide only what happens in case the
+authentication was successfull.
 */
 package main
 
@@ -22,11 +20,6 @@ package main
 #include <gssapi/gssapi_ext.h>
 
 // Helper functions for type conversions and struct access on Go-C boundary
-
-const gss_buffer_desc SERVICE_NAME = {
-	.value = "HTTP/localhost",
-	.length = 15
-};
 
 gss_buffer_t GssBufferTypeFromVoidPtr(void *buffer, size_t length) {
 	// https://tools.ietf.org/html/rfc2744.html#section-3.2
@@ -64,12 +57,6 @@ int GssBufferGetLength(gss_buffer_desc *buf) {
 // Wrapper around macro
 OM_uint32 GssError(OM_uint32 maj_stat) {
 	return GSS_ERROR(maj_stat);
-}
-
-gss_key_value_set_desc GssKeyValSetDesc() {
-	static gss_key_value_element_desc store_elements[] = { { .key = "keytab", .value = "/tmp/keytab" } };
-	static gss_key_value_set_desc cockpit_ktab_store = { .count = 1, .elements = store_elements };
-	return cockpit_ktab_store;
 }
 
 // Wrapper around macro
@@ -119,95 +106,6 @@ func main() {
 # Missing pieces:
  * Input token is not valid: do I need to process the input token somehow??
 */
-
-// Keytab represents loaded Kerberos keytab. Inside it uses GSSAPI generic storage
-// for credentials but we don't intend to support any other authentication than krb.
-type Keytab struct {
-	inner C.gss_cred_id_t
-}
-
-// LoadKeytab takes a filename of a keytab and uses GSSAPI extension from krb5 library
-// to load it as a Keytab structure which contains gss_cred_id_t structure
-func LoadKeytab() Keytab {
-	var majStat C.OM_uint32
-	var minStat C.OM_uint32
-
-	log.Println("gss_import_name")
-	//name := "HTTP/localhost"
-	//var inputNameBuffer C.gss_buffer_t = C.GssBufferTypeFromCharPtr(C.CString(name), (C.size_t)(len(name)))
-	var inputNameBuffer C.gss_buffer_t = &C.SERVICE_NAME
-	var serviceName C.gss_name_t
-	majStat = C.gss_import_name(
-		&minStat,
-		inputNameBuffer,
-		C.GSS_C_NO_OID,
-		&serviceName,
-	)
-	// Debug prints
-	log.Println("Major status:", majStat)
-	log.Println("Minor status:", minStat)
-
-	if C.GssError(majStat) != 0 {
-		log.Println("There was an error in import name function")
-		logGSSStatus(majStat, minStat)
-		panic("Failed to load credentials")
-	}
-
-	var outputName C.gss_buffer_t
-	var outputNameType C.gss_OID
-	majStat = C.gss_display_name(
-		&minStat,
-		serviceName,
-		outputName,
-		&outputNameType,
-	)
-
-	// Debug prints
-	log.Println("Major status:", majStat)
-	log.Println("Minor status:", minStat)
-
-	if C.GssError(majStat) != 0 {
-		log.Println("There was an error in display name function")
-		logGSSStatus(majStat, minStat)
-		panic("Failed to load credentials")
-	}
-
-	displayNameGo := C.GoString((*C.char)(outputName.value))
-	log.Println("display name:", displayNameGo)
-
-	var credHandle C.gss_cred_id_t = C.GSS_C_NO_CREDENTIAL
-	var cockpitKtabStore C.gss_key_value_set_desc = C.GssKeyValSetDesc()
-
-	log.Println("Empty credHandle:", credHandle == C.GSS_C_NO_CREDENTIAL)
-
-	majStat = C.gss_acquire_cred_from(
-		&minStat,                 // minor_status
-		serviceName,              // desired_name
-		C.GSS_C_INDEFINITE,       // time_req
-		C.GSS_C_NO_OID_SET,       // desired_mechs
-		C.GSS_C_ACCEPT,           // cred_usage
-		&cockpitKtabStore,        // cred_store
-		&credHandle,              // output_cred_handle
-		(*C.gss_OID_set)(C.NULL), // actual_mechs
-		(*C.OM_uint32)(C.NULL),   // time_rec
-	)
-
-	log.Println("Empty credHandle:", credHandle == C.GSS_C_NO_CREDENTIAL)
-
-	// Debug prints
-	log.Println("Major status:", majStat)
-	log.Println("Minor status:", minStat)
-
-	if C.GssError(majStat) != 0 {
-		log.Println("There was an error in loading credentials")
-		logGSSStatus(majStat, minStat)
-		panic("Failed to load credentials")
-	}
-
-	return Keytab{
-		inner: credHandle,
-	}
-}
 
 // RequestAuthenticated is a guard to an HTTP request and returns boolean value indicating
 // that the user is successfully authenticated
@@ -279,7 +177,7 @@ func RequestAuthenticated(w http.ResponseWriter, r *http.Request) bool {
 	// FIXME: Invalid token was supplied
 	// Client side uses:
 	// $ echo password | kinit user@LOCAL
-	// $ curl -v --negotiate -u user:password localhost:9000
+	// $ curl -v --negotiate -u : localhost:9000
 	majStat := C.gss_accept_sec_context(
 		&minStat,
 		&contextHdl,
