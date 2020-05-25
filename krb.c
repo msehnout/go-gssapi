@@ -4,11 +4,7 @@
 
 #include "krb.h"
 
-void DoSth()
-{
-    goLog("ahoj from DoSth");
-}
-
+// report_error takes the major and minor status from GSSAPI calls and turns them into human readable strings
 void report_error(OM_uint32 maj_stat, OM_uint32 min_stat)
 {
     OM_uint32 message_context;
@@ -38,10 +34,17 @@ void report_error(OM_uint32 maj_stat, OM_uint32 min_stat)
         gss_release_buffer(&min_status, &status_string);
 
     } while (message_context != 0);
+
+    free(printer);
 }
 
+
+// requestAuthenticated takes the decoded token from the WWW-Authenticate header in the
+// HTTP request and returns an HTTP status that should go to the user.
 int requestAuthenticated(void *input_buffer, size_t len)
 {
+    // This code is mostly copy-pasted from the RFC:
+    // https://tools.ietf.org/html/rfc2744#section-5.1
     OM_uint32 maj_stat, min_stat, time_rec;
     gss_ctx_id_t context_hdl = GSS_C_NO_CONTEXT;
     gss_cred_id_t cred_hdl = GSS_C_NO_CREDENTIAL, deleg_cred = GSS_C_NO_CREDENTIAL;
@@ -55,6 +58,7 @@ int requestAuthenticated(void *input_buffer, size_t len)
         .length = len,
     };
 
+    // Helper buffer to be used with snprintf
     const size_t PRINTER_SIZE = 1000;
     char *printer = (char *)malloc(PRINTER_SIZE);
     snprintf(printer, PRINTER_SIZE, "Pointer %p, size %zd", input_buffer, len);
@@ -80,7 +84,8 @@ int requestAuthenticated(void *input_buffer, size_t len)
         };
         if (output.length != 0)
         {
-            //send_token_to_peer(output_token);
+            // We need to support multiple HTTP requests-responses here. I'm not sure whether this should be implemented
+            // as a single TCP connection or an HTTP session with cookies.
             goLog("I'd like to send a token to the peer. Please implement it!");
             gss_release_buffer(&min_stat, &output);
         };
@@ -94,6 +99,7 @@ int requestAuthenticated(void *input_buffer, size_t len)
         };
     } while (maj_stat & GSS_S_CONTINUE_NEEDED);
 
+    // Log the user name
     maj_stat = gss_display_name(&min_stat, client_name, &display, NULL);
     if (GSS_ERROR(maj_stat))
     {
@@ -102,6 +108,8 @@ int requestAuthenticated(void *input_buffer, size_t len)
     snprintf(printer, PRINTER_SIZE, "%s", display.value);
     goLog(printer);
 
+    free(printer);
 
+    // XXX: Do I need to make sure the user was authenticated successfully here?
     return 200;
 }

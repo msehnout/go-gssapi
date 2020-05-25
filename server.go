@@ -24,9 +24,6 @@ package main
 
 extern void goLog(char *);
 
-static void TestCGO() {
-	goLog("1, 2");
-}
 */
 import "C"
 
@@ -53,9 +50,6 @@ func goLog(text *C.char) {
 func main() {
 	portNumber := "9000"
 
-	C.TestCGO()
-	C.DoSth()
-
 	// Create a handler function which takes the keytab in a closure.
 	// TODO: I assume it is static and safe to share between the go green
 	// threads, but this assumtion might be wrong
@@ -69,14 +63,6 @@ func main() {
 }
 
 // === GSSAPI wrapper ===
-
-/*
-# Unresolved questions:
- * How to get the username from token in HTTP header, we need to know who is authenticated.
-
-# Missing pieces:
- * Input token is not valid: do I need to process the input token somehow??
-*/
 
 // RequestAuthenticated is a guard to an HTTP request and returns boolean value indicating
 // that the user is successfully authenticated
